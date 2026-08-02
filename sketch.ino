@@ -13,6 +13,7 @@
 #include "Adafruit_GFX.h"
 #include "Adafruit_ILI9341.h"
 #include <XPT2046_Touchscreen.h>
+#include <Preferences.h>
 
 // ---------------------------------------------------------------- Display ---
 // Pins are set here, in the sketch, not in a library config file.
@@ -33,6 +34,10 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 // inserts its auto-generated prototypes right above the first function, and
 // any prototype mentioning Zone fails if the type is declared further down.
 struct Zone { int x, y, w, h; };
+
+// Which screen we're on. Spins and result screens block inline, so they
+// don't need entries here.
+enum GState { ST_BET, ST_SCORES, ST_NAME };
 
 // ------------------------------------------------------------------ Touch ---
 #define XPT2046_IRQ  36
@@ -257,6 +262,61 @@ void clearBets() {
   for (int i = 0; i < 6;  i++) betOutside[i] = 0;
 }
 
+// ------------------------------------------------------------ Persistence ---
+// Settings and scores live in the ESP32's flash (NVS), so they survive being
+// unplugged. Note the simulator starts with blank flash every run, so the
+// leaderboard only really persists on the real board.
+Preferences prefs;
+
+#define NAME_MAX 10
+#define N_SCORES 5
+
+char hsName[N_SCORES][NAME_MAX + 1];
+int  hsVal[N_SCORES] = { 0, 0, 0, 0, 0 };
+int  hsNew = -1;            // row just inserted, highlighted on the table
+int  cashPending = 0;       // amount being banked while the name is typed
+char nameBuf[NAME_MAX + 1];
+int  nameLen = 0;
+
+GState state = ST_BET;
+
+void loadScores() {
+  char k[8];
+  for (int i = 0; i < N_SCORES; i++) {
+    snprintf(k, sizeof k, "hs%dv", i);
+    hsVal[i] = prefs.getInt(k, 0);
+    snprintf(k, sizeof k, "hs%dn", i);
+    String nm = prefs.getString(k, "");
+    strncpy(hsName[i], nm.c_str(), NAME_MAX);
+    hsName[i][NAME_MAX] = 0;
+  }
+}
+
+void saveScores() {
+  char k[8];
+  for (int i = 0; i < N_SCORES; i++) {
+    snprintf(k, sizeof k, "hs%dv", i);
+    prefs.putInt(k, hsVal[i]);
+    snprintf(k, sizeof k, "hs%dn", i);
+    prefs.putString(k, hsName[i]);
+  }
+}
+
+// Returns the row the score landed in, or -1 if it didn't make the table.
+int insertScore(const char* nm, int v) {
+  int pos = -1;
+  for (int i = 0; i < N_SCORES; i++) if (v > hsVal[i]) { pos = i; break; }
+  if (pos < 0) return -1;
+  for (int i = N_SCORES - 1; i > pos; i--) {
+    hsVal[i] = hsVal[i - 1];
+    strcpy(hsName[i], hsName[i - 1]);
+  }
+  hsVal[pos] = v;
+  strncpy(hsName[pos], nm, NAME_MAX);
+  hsName[pos][NAME_MAX] = 0;
+  return pos;
+}
+
 // ---------------------------------------------------------------- History ---
 #define MAX_HIST 15
 uint8_t hist[MAX_HIST];
@@ -299,6 +359,26 @@ const Zone Z_MINUS = {   4, 182, 30, 26 };
 const Zone Z_PLUS  = {  86, 182, 30, 26 };
 const Zone Z_CLEAR = { 124, 182, 84, 26 };
 const Zone Z_SPIN  = { 216, 182, 100, 50 };
+
+// Tapping your bankroll in the header opens the leaderboard.
+const Zone Z_BANK  = { 220,   0, 100, HDR_H };
+
+// Buttons on the leaderboard screen.
+const Zone Z_CASH  = {  16, 190, 140, 40 };
+const Zone Z_BACK  = { 180, 190, 124, 40 };
+
+// On-screen keyboard: 10 columns x 4 rows of 32x40 cells.
+#define KB_X0   0
+#define KB_Y0   76
+#define KB_CW   32
+#define KB_CH   40
+#define KB_COLS 10
+#define KB_ROWS 4
+#define KB_NCHARS 36
+#define KB_SPC  36
+#define KB_DEL  37
+#define KB_OK   38
+const char* KB_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 bool inZone(const Zone &z, int x, int y) {
   return x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h;
@@ -464,6 +544,107 @@ void drawAll() {
   drawPanel();
 }
 
+// ------------------------------------------------------------ Score screen ---
+void drawScoresScreen() {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, SCR_W, HDR_H, C_PANEL);
+  textC("HIGH SCORES", 160, HDR_H / 2, 2, C_GOLD);
+
+  int pot = bankroll + totalStaked();
+
+  for (int i = 0; i < N_SCORES; i++) {
+    int y = 34 + i * 26;
+    uint16_t col = (i == hsNew) ? C_GOLD : C_WHITE;
+
+    char rank[4];
+    snprintf(rank, sizeof rank, "%d.", i + 1);
+    textAt(rank, 10, y, 2, col);
+
+    const char* nm = hsName[i][0] ? hsName[i] : "---";
+    textAt(nm, 42, y, 2, col);
+
+    char v[16];
+    snprintf(v, sizeof v, "$%d", hsVal[i]);
+    textR(v, SCR_W - 10, y + 8, 2, col);
+  }
+
+  if (hsNew >= 0) {
+    textC("Tap anywhere to play on", 160, 176, 1, C_GREY);
+  } else {
+    char cash[24];
+    snprintf(cash, sizeof cash, "CASH OUT $%d", pot);
+    drawButton(Z_CASH, cash, C_GOLD, 1);
+    drawButton(Z_BACK, "BACK", C_WHITE, 2);
+    textC("Cashing out banks your total and restarts at $1000",
+          160, 172, 1, C_GREY);
+  }
+}
+
+// ------------------------------------------------------------- Name entry ---
+void drawNameText() {
+  tft.fillRect(0, 30, SCR_W, 40, C_BLACK);
+  const char* shown = nameLen ? nameBuf : "_";
+  textC(shown, 160, 48, 3, C_GOLD);
+}
+
+void drawNameEntry() {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, SCR_W, HDR_H, C_PANEL);
+  char t[32];
+  snprintf(t, sizeof t, "YOU BANKED $%d", cashPending);
+  textC(t, 160, HDR_H / 2, 2, C_GOLD);
+
+  drawNameText();
+
+  for (int r = 0; r < KB_ROWS; r++) {
+    for (int c = 0; c < KB_COLS; c++) {
+      int idx = r * KB_COLS + c;
+      int x = KB_X0 + c * KB_CW, y = KB_Y0 + r * KB_CH;
+      tft.drawRect(x, y, KB_CW, KB_CH, C_LINE);
+
+      char lbl[4];
+      int size = 2;
+      uint16_t col = C_WHITE;
+      if (idx < KB_NCHARS) {
+        lbl[0] = KB_CHARS[idx]; lbl[1] = 0;
+      } else if (idx == KB_SPC) {
+        strcpy(lbl, "SP"); col = C_GREY;
+      } else if (idx == KB_DEL) {
+        strcpy(lbl, "DEL"); size = 1; col = C_GREY;
+      } else {
+        strcpy(lbl, "OK"); col = C_GOLD;
+      }
+      textC(lbl, x + KB_CW / 2, y + KB_CH / 2, size, col);
+    }
+  }
+}
+
+// Commits the typed name to the table. Shared by touch and keyboard.
+void submitName() {
+  while (nameLen > 0 && nameBuf[nameLen - 1] == ' ') nameBuf[--nameLen] = 0;
+  if (nameLen == 0) { drawNameText(); return; }
+  hsNew = insertScore(nameBuf, cashPending);
+  saveScores();
+  sWin();
+  state = ST_SCORES;
+  drawScoresScreen();
+}
+
+void typeChar(char ch) {
+  if (nameLen >= NAME_MAX) return;
+  nameBuf[nameLen++] = ch;
+  nameBuf[nameLen] = 0;
+  sClick();
+  drawNameText();
+}
+
+void backspace() {
+  if (nameLen == 0) return;
+  nameBuf[--nameLen] = 0;
+  sClick();
+  drawNameText();
+}
+
 // ---------------------------------------------------------------- Placing ---
 bool placeBet(int x, int y) {
   int chip = CHIPS[chipIdx];
@@ -502,7 +683,14 @@ bool placeBet(int x, int y) {
 // The simulator has no touch, so the board can also be driven from the serial
 // monitor. The cursor stays hidden until the first key arrives, so on real
 // hardware -- where nothing is typed -- none of this ever shows up.
-void doSpin();          // defined below, called by the key handler
+// Defined further down; the key handler needs them early.
+void doSpin();
+void doCashOut();
+void openScores();
+void resetGame();
+void submitName();
+void typeChar(char ch);
+void backspace();
 
 bool kbActive = false;
 int curSec = 0;      // 0 = number grid, 1 = dozens, 2 = even money
@@ -589,13 +777,34 @@ void placeAtCursor() {
 }
 
 void printKeyHelp() {
-  Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip  m mute");
+  Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip");
+  Serial.println("          k scores/cash out  m mute");
   Serial.println("(type into the box under the serial monitor, then press Enter)");
 }
 
 void handleKey(char k) {
-  if (k == '\n' || k == '\r') return;       // Wokwi sends a newline per line
-  if (!kbActive) { kbActive = true; drawCursorBox(); printKeyHelp(); }
+  if (!kbActive && k != '\n' && k != '\r') {
+    kbActive = true; drawCursorBox(); printKeyHelp();
+  }
+
+  // While typing a name, letters are letters -- not movement commands.
+  if (state == ST_NAME) {
+    if (k == '\n' || k == '\r') { submitName(); return; }
+    if (k == 8 || k == 127 || k == '<') { backspace(); return; }
+    if (k >= 'a' && k <= 'z') k = k - 'a' + 'A';
+    if ((k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9') || k == ' ') typeChar(k);
+    return;
+  }
+
+  if (k == '\n' || k == '\r') return;    // Wokwi sends a newline per line
+
+  if (state == ST_SCORES) {
+    if (hsNew >= 0)                    { resetGame(); return; }
+    if (k == 'x' || k == 'X')          { sClick(); doCashOut(); }
+    else if (k == 'b' || k == 'B' ||
+             k == 'k' || k == 'K')     { sClick(); state = ST_BET; drawAll(); drawCursorBox(); }
+    return;
+  }
 
   switch (k) {
     case 'w': case 'W': moveCursor(0, -1); break;
@@ -606,6 +815,7 @@ void handleKey(char k) {
     case 'g': case 'G':
       if (totalStaked() > 0) { doSpin(); drawCursorBox(); }
       break;
+    case 'k': case 'K': sClick(); openScores(); break;
     case 'c': case 'C':
       bankroll += totalStaked();
       clearBets();
@@ -620,6 +830,7 @@ void handleKey(char k) {
       break;
     case 'm': case 'M':
       soundOn = !soundOn;
+      prefs.putBool("sound", soundOn);
       if (soundOn) sClick();
       Serial.printf("Sound %s\n", soundOn ? "on" : "off");
       break;
@@ -814,11 +1025,78 @@ void doSpin() {
     textC("for a fresh $1000", 160, 158, 2, C_WHITE);
     waitForTap();
     ledOff();
-    bankroll = 1000;
-    histCount = 0;
+    resetGame();
+    return;
   }
 
   drawAll();
+  drawCursorBox();
+}
+
+// ----------------------------------------------------------- Screen flow ---
+void resetGame() {
+  bankroll = 1000;
+  clearBets();
+  histCount = 0;
+  hsNew = -1;
+  state = ST_BET;
+  drawAll();
+  drawCursorBox();
+}
+
+void doCashOut() {
+  cashPending = bankroll + totalStaked();
+  clearBets();
+  Serial.printf("Cash out: $%d\n", cashPending);
+
+  if (cashPending > hsVal[N_SCORES - 1]) {
+    nameLen = 0; nameBuf[0] = 0;
+    state = ST_NAME;
+    drawNameEntry();
+  } else {
+    sLose();
+    resetGame();
+  }
+}
+
+void openScores() {
+  hsNew = -1;
+  state = ST_SCORES;
+  drawScoresScreen();
+}
+
+void handleTapScores(int x, int y) {
+  if (hsNew >= 0) { resetGame(); return; }   // just set a score: any tap plays on
+  if (inZone(Z_CASH, x, y)) { sClick(); doCashOut(); }
+  else if (inZone(Z_BACK, x, y)) { sClick(); state = ST_BET; drawAll(); drawCursorBox(); }
+}
+
+void handleTapName(int x, int y) {
+  if (x < KB_X0 || y < KB_Y0) return;
+  int c = (x - KB_X0) / KB_CW, r = (y - KB_Y0) / KB_CH;
+  if (c >= KB_COLS || r >= KB_ROWS) return;
+  int idx = r * KB_COLS + c;
+  if      (idx < KB_NCHARS) typeChar(KB_CHARS[idx]);
+  else if (idx == KB_SPC)   typeChar(' ');
+  else if (idx == KB_DEL)   backspace();
+  else                      submitName();
+}
+
+void handleTapBetting(int x, int y) {
+  if (inZone(Z_BANK, x, y)) { sClick(); openScores(); return; }
+  if (inZone(Z_SPIN, x, y)) {
+    if (totalStaked() > 0) doSpin();
+  } else if (inZone(Z_CLEAR, x, y)) {
+    bankroll += totalStaked();
+    clearBets();
+    drawHeader(); drawTable(); sClick();
+  } else if (inZone(Z_MINUS, x, y)) {
+    if (chipIdx > 0) { chipIdx--; drawChipValue(); sClick(); }
+  } else if (inZone(Z_PLUS, x, y)) {
+    if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); sClick(); }
+  } else {
+    if (placeBet(x, y)) { drawHeader(); sChip(); }
+  }
 }
 
 // ------------------------------------------------------------------ Setup ---
@@ -842,12 +1120,16 @@ void setup() {
   ts.begin(touchSPI);
   ts.setRotation(1);
 
+  prefs.begin("roulette", false);
+  soundOn = prefs.getBool("sound", true);
+  loadScores();
+
   clearBets();
   drawAll();
 
   Serial.println("CYD Roulette ready.");
   Serial.println("No touchscreen? Drive it from here:");
-  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip size  m mute");
+  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip  k scores  m mute");
 }
 
 void loop() {
@@ -855,20 +1137,10 @@ void loop() {
 
   int x, y;
   if (getTap(x, y)) {
-    if (inZone(Z_SPIN, x, y)) {
-      if (totalStaked() > 0) doSpin();
-    } else if (inZone(Z_CLEAR, x, y)) {
-      bankroll += totalStaked();
-      clearBets();
-      drawHeader();
-      drawTable();
-      sClick();
-    } else if (inZone(Z_MINUS, x, y)) {
-      if (chipIdx > 0) { chipIdx--; drawChipValue(); sClick(); }
-    } else if (inZone(Z_PLUS, x, y)) {
-      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); sClick(); }
-    } else {
-      if (placeBet(x, y)) { drawHeader(); sChip(); }
+    switch (state) {
+      case ST_BET:    handleTapBetting(x, y); break;
+      case ST_SCORES: handleTapScores(x, y);  break;
+      case ST_NAME:   handleTapName(x, y);    break;
     }
   }
   delay(20);
