@@ -139,7 +139,6 @@ const int   DUTY_AT_VOL[N_VOL_LEVELS] = { 0, 32, 96, 200 };   // out of 255
 
 int volLevel = VOL_MED;
 
-#define TONE_CHANNEL 0
 #define TONE_RES_BITS 8    // duty is 0-255
 
 void ledSet(bool r, bool g, bool b) {
@@ -155,10 +154,10 @@ void ledOff() { ledSet(false, false, false); }
 void toneStart(int freq) {
   int duty = DUTY_AT_VOL[volLevel];
   if (duty <= 0) return;
-  ledcWriteTone(TONE_CHANNEL, freq);
-  ledcWrite(TONE_CHANNEL, duty);
+  ledcWriteTone(SPEAKER_PIN, freq);
+  ledcWrite(SPEAKER_PIN, duty);
 }
-void toneStop() { ledcWrite(TONE_CHANNEL, 0); }
+void toneStop() { ledcWrite(SPEAKER_PIN, 0); }
 
 // Non-blocking: starts the tone and returns; the caller keeps drawing while
 // the ESP32's LEDC hardware keeps generating the wave. `ms` is honored by a
@@ -1414,8 +1413,7 @@ void setup() {
   pinMode(LED_B, OUTPUT);
   ledOff();
 
-  ledcSetup(TONE_CHANNEL, 2000, TONE_RES_BITS);
-  ledcAttachPin(SPEAKER_PIN, TONE_CHANNEL);
+  ledcAttach(SPEAKER_PIN, 2000, TONE_RES_BITS);
 
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
