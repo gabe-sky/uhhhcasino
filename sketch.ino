@@ -55,19 +55,23 @@ enum GState { ST_BET, ST_SCORES, ST_NAME };
 SPIClass touchSPI = SPIClass(VSPI);
 XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 
+// A touch only counts if it has real pressure AND isn't at raw (0,0).
+// A disconnected or unemulated touch chip reads back as all zeros, which the
+// library reports as maximum pressure at the origin -- a permanent fake press.
+bool realTouch(TS_Point &p) {
+  if (!ts.touched()) return false;
+  p = ts.getPoint();
+  if (p.x == 0 && p.y == 0) return false;
+  return p.z >= TOUCH_MIN_PRESSURE;
+}
+
 bool getTap(int &x, int &y) {
   static bool wasDown = false;
   bool isDown = ts.touched();
   bool fresh = false;
   if (isDown && !wasDown) {
-    TS_Point p = ts.getPoint();
-    // A disconnected or unresponsive touch chip reads back as all zeros,
-    // which the library reports as maximum pressure at raw (0,0). A real
-    // finger never lands on exactly 0,0, so treat that pattern as no touch.
-    // Without this, a loose ribbon cable would dump the bankroll onto the
-    // top-left cell hundreds of times a second.
-    bool phantom = (p.x == 0 && p.y == 0);
-    if (p.z >= TOUCH_MIN_PRESSURE && !phantom) {
+    TS_Point p;
+    if (realTouch(p)) {
       x = map(p.x, RAW_X_MIN, RAW_X_MAX, 0, SCR_W);
       y = map(p.y, RAW_Y_MIN, RAW_Y_MAX, 0, SCR_H);
       x = constrain(x, 0, SCR_W - 1);
@@ -81,15 +85,29 @@ bool getTap(int &x, int &y) {
   return fresh;
 }
 
-// Continues on either a screen tap or any key typed into the serial monitor.
-// Without the serial half, the result screen would hang forever in a
-// simulator that has no touch.
+// Continues on a real screen tap or any key typed into the serial monitor.
+//
+// The release wait is bounded: if the touch line is stuck reporting a press
+// (unemulated chip, loose ribbon cable), we give up waiting for a release
+// after a moment and carry on watching for input. Without that bound, this
+// function could never return and the game would freeze on the result screen.
 void waitForTap() {
-  while (ts.touched()) delay(20);
+  TS_Point p;
+  unsigned long t0 = millis();
+  while (realTouch(p) && millis() - t0 < 600) delay(20);
+
   while (Serial.available()) Serial.read();
+
   for (;;) {
-    if (ts.touched()) { while (ts.touched()) delay(20); return; }
-    if (Serial.available()) { while (Serial.available()) Serial.read(); return; }
+    if (realTouch(p)) {
+      unsigned long t1 = millis();
+      while (realTouch(p) && millis() - t1 < 600) delay(20);
+      return;
+    }
+    if (Serial.available()) {
+      while (Serial.available()) Serial.read();
+      return;
+    }
     delay(20);
   }
 }
@@ -981,7 +999,8 @@ void showResult(uint8_t win, int net) {
     snprintf(buf, sizeof buf, "Even");
   }
   textC(buf, 160, GRID_Y + 90, 2, col);
-  textC("Tap or press a key to continue", 160, GRID_Y + 110, 1, C_GREY);
+  textC("Tap screen, or send any key (try x) to continue",
+        160, GRID_Y + 110, 1, C_GREY);
 }
 
 void doSpin() {
@@ -1021,7 +1040,7 @@ void doSpin() {
     ledSet(true, false, false);
     textC("BUSTED", 160, 96, 4, C_LOSE);
     sBust();
-    textC("Tap or press a key", 160, 136, 2, C_WHITE);
+    textC("Tap or send x", 160, 136, 2, C_WHITE);
     textC("for a fresh $1000", 160, 158, 2, C_WHITE);
     waitForTap();
     ledOff();
