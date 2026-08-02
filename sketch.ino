@@ -11,6 +11,12 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
+// The backlight pin. Some setups of TFT_eSPI define this for us; if not,
+// GPIO 21 is where it lives on the Cheap Yellow Display.
+#ifndef TFT_BL
+  #define TFT_BL 21
+#endif
+
 // ------------------------------------------------------------------ Touch ---
 #define XPT2046_IRQ  36
 #define XPT2046_MOSI 32
