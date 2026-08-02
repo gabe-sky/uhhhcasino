@@ -210,15 +210,17 @@ bool isRed(uint8_t n) {
   return false;
 }
 
+// 0 is green like a normal wheel; 38, our second zero, gets a gold cell so
+// it reads as its own thing rather than a twin of the 0 at the far end.
 uint16_t pocketColor(uint8_t n) {
-  if (isGreen(n)) return C_GREEN;
+  if (n == ZERO_B) return C_GOLD;
+  if (n == ZERO_A) return C_GREEN;
   return isRed(n) ? C_RED : C_BLACK;
 }
 
-// The second zero wears gold so it reads as its own thing at a glance,
-// rather than looking like a twin of the 0 at the far end.
+// Black numerals on the gold cell; white everywhere else.
 uint16_t pocketTextColor(uint8_t n) {
-  return (n == ZERO_B) ? C_GOLD : C_WHITE;
+  return (n == ZERO_B) ? C_BLACK : C_WHITE;
 }
 
 // ------------------------------------------------------------------- Bets ---
@@ -632,7 +634,14 @@ void handleKey(char k) {
 #define TILE_W   44
 #define WHEEL_PX (38 * TILE_W)
 
-void drawStrip(int offset) {
+// Draws the strip at a given scroll offset.
+//
+// `detail` controls whether numbers are drawn. Adafruit_GFX renders text one
+// font pixel at a time -- a two-digit number is ~80 separate draw calls -- so
+// numbers cost far more than the colored blocks behind them. During the fast
+// blur we skip them entirely (you couldn't read them anyway, and a real wheel
+// is a blur too), and even when slow we only letter the tiles near the marker.
+void drawStrip(int offset, bool detail) {
   int cy = STRIP_Y + STRIP_H / 2;
   int first = offset / TILE_W;
   int shift = offset % TILE_W;
@@ -641,15 +650,27 @@ void drawStrip(int offset) {
     int idx = ((first + i) % 38 + 38) % 38;
     uint8_t n = WHEEL[idx];
     int x = i * TILE_W - shift;
+    int cxTile = x + (TILE_W - 2) / 2;
+    if (cxTile < -TILE_W || cxTile > SCR_W + TILE_W) continue;
+
     uint16_t c = pocketColor(n);
     tft.fillRect(x, STRIP_Y, TILE_W - 2, STRIP_H, c);
     tft.drawRect(x, STRIP_Y, TILE_W - 2, STRIP_H, C_LINE);
-    numC(n, x + (TILE_W - 2) / 2, cy, 3, pocketTextColor(n));
+
+    // Only letter the three tiles closest to the marker.
+    if (detail && cxTile > 160 - 90 && cxTile < 160 + 90) {
+      numC(n, cxTile, cy, 3, pocketTextColor(n));
+    }
   }
 
   tft.fillTriangle(160, STRIP_Y - 9, 153, STRIP_Y - 1, 167, STRIP_Y - 1, C_GOLD);
   tft.drawFastVLine(160, STRIP_Y, STRIP_H, C_GOLD);
 }
+
+// How long a spin lasts, in milliseconds. This is wall-clock time, not a
+// frame count, so it holds regardless of how fast the board can draw.
+#define SPIN_MS      7000
+#define DETAIL_AFTER 0.55f   // fraction of the spin after which numbers appear
 
 uint8_t spinWheel() {
   int winIdx = esp_random() % 38;
@@ -665,32 +686,31 @@ uint8_t spinWheel() {
   while (targetOffset < 0) targetOffset += WHEEL_PX;
   targetOffset %= WHEEL_PX;
 
-  int totalTravel = WHEEL_PX * 4 + targetOffset;
-  int travelled = 0;
-  float speed = 46.0f;
+  long total = (long)WHEEL_PX * 2 + targetOffset;
+
+  unsigned long start = millis();
   int lastTile = -1;
 
-  while (travelled < totalTravel) {
-    int remaining = totalTravel - travelled;
-    if (remaining < 1200) speed = 2.0f + (remaining / 1200.0f) * 44.0f;
-    if (speed < 2.0f) speed = 2.0f;
+  for (;;) {
+    unsigned long el = millis() - start;
+    if (el >= SPIN_MS) break;
 
-    travelled += (int)speed;
-    if (travelled > totalTravel) travelled = totalTravel;
+    float p = (float)el / (float)SPIN_MS;
+    float inv = 1.0f - p;
+    float eased = 1.0f - inv * inv * inv;      // cubic ease-out
+    long travelled = (long)(total * eased);
+    int offset = (int)(travelled % WHEEL_PX);
 
-    int offset = travelled % WHEEL_PX;
-    drawStrip(offset);
+    bool detail = p > DETAIL_AFTER;
+    drawStrip(offset, detail);
 
-    // Tick once per pocket, but only once it has slowed enough for the
-    // individual ticks to be audible. At full speed it would be a buzz.
-    if (speed < 26.0f) {
+    if (detail) {
       int tile = ((offset + 160) / TILE_W) % 38;
       if (tile != lastTile) { sTick(); lastTile = tile; }
     }
-
-    delay(16);
   }
 
+  drawStrip(targetOffset, true);              // settle exactly on the winner
   return WHEEL[winIdx];
 }
 
@@ -731,7 +751,10 @@ void showResult(uint8_t win, int net) {
   tft.drawRoundRect(120, GRID_Y + 4, 80, 52, 6, C_WHITE);
   numC(win, 160, GRID_Y + 30, 5, pocketTextColor(win));
 
-  const char* word = isGreen(win) ? "GREEN" : (isRed(win) ? "RED" : "BLACK");
+  const char* word;
+  if      (win == ZERO_B) word = "GOLD";     // still a zero, just gold-suited
+  else if (win == ZERO_A) word = "GREEN";
+  else                    word = isRed(win) ? "RED" : "BLACK";
   textC(word, 160, GRID_Y + 68, 2, C_WHITE);
 
   char buf[32];
