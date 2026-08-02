@@ -56,7 +56,13 @@ bool getTap(int &x, int &y) {
   bool fresh = false;
   if (isDown && !wasDown) {
     TS_Point p = ts.getPoint();
-    if (p.z >= TOUCH_MIN_PRESSURE) {
+    // A disconnected or unresponsive touch chip reads back as all zeros,
+    // which the library reports as maximum pressure at raw (0,0). A real
+    // finger never lands on exactly 0,0, so treat that pattern as no touch.
+    // Without this, a loose ribbon cable would dump the bankroll onto the
+    // top-left cell hundreds of times a second.
+    bool phantom = (p.x == 0 && p.y == 0);
+    if (p.z >= TOUCH_MIN_PRESSURE && !phantom) {
       x = map(p.x, RAW_X_MIN, RAW_X_MAX, 0, SCR_W);
       y = map(p.y, RAW_Y_MIN, RAW_Y_MAX, 0, SCR_H);
       x = constrain(x, 0, SCR_W - 1);
@@ -81,6 +87,59 @@ void waitForTap() {
     if (Serial.available()) { while (Serial.available()) Serial.read(); return; }
     delay(20);
   }
+}
+
+// ------------------------------------------------------- Sound and light ---
+#define SPEAKER_PIN 26
+#define LED_R 4          // onboard RGB LED, active LOW
+#define LED_G 16
+#define LED_B 17
+
+bool soundOn = true;
+
+void ledSet(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r ? LOW : HIGH);
+  digitalWrite(LED_G, g ? LOW : HIGH);
+  digitalWrite(LED_B, b ? LOW : HIGH);
+}
+void ledOff() { ledSet(false, false, false); }
+
+// Non-blocking: the tone plays out on a hardware timer while we keep drawing.
+void blip(int freq, int ms) {
+  if (!soundOn) return;
+  tone(SPEAKER_PIN, freq, ms);
+}
+
+// Blocking, for jingles where we want the notes in order.
+void note(int freq, int ms) {
+  if (!soundOn) { delay(ms); return; }
+  tone(SPEAKER_PIN, freq, ms);
+  delay(ms);
+  noTone(SPEAKER_PIN);
+}
+
+void sClick() { blip(2200, 12); }
+void sChip()  { blip(1400, 18); }
+void sTick()  { blip(1900,  6); }
+
+void sSpinUp() {
+  if (!soundOn) return;
+  for (int f = 400; f < 1600; f += 120) { tone(SPEAKER_PIN, f, 18); delay(14); }
+  noTone(SPEAKER_PIN);
+}
+
+void sWin() {
+  note(784, 90); note(988, 90); note(1319, 160);
+}
+
+void sLose() {
+  note(392, 110); note(330, 110); note(262, 200);
+}
+
+void sPush() { note(523, 80); note(523, 80); }
+
+void sBust() {
+  note(392, 180); note(370, 180); note(349, 180); note(330, 420);
 }
 
 // ----------------------------------------------------------------- Colors ---
@@ -154,6 +213,12 @@ bool isRed(uint8_t n) {
 uint16_t pocketColor(uint8_t n) {
   if (isGreen(n)) return C_GREEN;
   return isRed(n) ? C_RED : C_BLACK;
+}
+
+// The second zero wears gold so it reads as its own thing at a glance,
+// rather than looking like a twin of the 0 at the far end.
+uint16_t pocketTextColor(uint8_t n) {
+  return (n == ZERO_B) ? C_GOLD : C_WHITE;
 }
 
 // ------------------------------------------------------------------- Bets ---
@@ -282,7 +347,7 @@ void drawHistory() {
     uint16_t c = pocketColor(n);
     tft.fillRoundRect(x, HIST_Y + 2, cw - 3, HIST_H - 4, 2, c);
     tft.drawRoundRect(x, HIST_Y + 2, cw - 3, HIST_H - 4, 2, C_LINE);
-    numC(n, x + (cw - 3) / 2, HIST_Y + HIST_H / 2, 1, C_WHITE);
+    numC(n, x + (cw - 3) / 2, HIST_Y + HIST_H / 2, 1, pocketTextColor(n));
   }
 }
 
@@ -324,7 +389,7 @@ void drawOneNumber(uint8_t n) {
   uint16_t c = pocketColor(n);
   tft.fillRect(x, y, w, h, c);
   tft.drawRect(x, y, w, h, C_LINE);
-  numC(n, x + w / 2, y + h / 2, isGreen(n) ? 2 : 1, C_WHITE);
+  numC(n, x + w / 2, y + h / 2, isGreen(n) ? 2 : 1, pocketTextColor(n));
   drawNumberBetMark(x, y, w, h, betNum[n]);
 }
 
@@ -499,6 +564,7 @@ void moveCursor(int dx, int dy) {
     else                  curOb  = constrain(curOb  + dx, 0, 5);
   }
   drawCursorBox();
+  sClick();
 }
 
 void placeAtCursor() {
@@ -517,10 +583,11 @@ void placeAtCursor() {
   }
   drawCursorBox();
   drawHeader();
+  sChip();
 }
 
 void printKeyHelp() {
-  Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip size");
+  Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip  m mute");
   Serial.println("(type into the box under the serial monitor, then press Enter)");
 }
 
@@ -541,12 +608,18 @@ void handleKey(char k) {
       bankroll += totalStaked();
       clearBets();
       drawHeader(); drawTable(); drawCursorBox();
+      sClick();
       break;
     case '-': case '_':
-      if (chipIdx > 0) { chipIdx--; drawChipValue(); }
+      if (chipIdx > 0) { chipIdx--; drawChipValue(); sClick(); }
       break;
     case '+': case '=':
-      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); }
+      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); sClick(); }
+      break;
+    case 'm': case 'M':
+      soundOn = !soundOn;
+      if (soundOn) sClick();
+      Serial.printf("Sound %s\n", soundOn ? "on" : "off");
       break;
     default: break;
   }
@@ -571,7 +644,7 @@ void drawStrip(int offset) {
     uint16_t c = pocketColor(n);
     tft.fillRect(x, STRIP_Y, TILE_W - 2, STRIP_H, c);
     tft.drawRect(x, STRIP_Y, TILE_W - 2, STRIP_H, C_LINE);
-    numC(n, x + (TILE_W - 2) / 2, cy, 3, C_WHITE);
+    numC(n, x + (TILE_W - 2) / 2, cy, 3, pocketTextColor(n));
   }
 
   tft.fillTriangle(160, STRIP_Y - 9, 153, STRIP_Y - 1, 167, STRIP_Y - 1, C_GOLD);
@@ -581,8 +654,10 @@ void drawStrip(int offset) {
 uint8_t spinWheel() {
   int winIdx = esp_random() % 38;
 
+  ledOff();
   tft.fillRect(0, GRID_Y - 2, SCR_W, PANEL_Y - GRID_Y + 2, C_BLACK);
   textC("No more bets!", 160, PANEL_Y - 14, 2, C_GOLD);
+  sSpinUp();
 
   // The marker sits at x=160, so the winning tile must finish under it.
   int centerTile = 160 / TILE_W;
@@ -593,6 +668,7 @@ uint8_t spinWheel() {
   int totalTravel = WHEEL_PX * 4 + targetOffset;
   int travelled = 0;
   float speed = 46.0f;
+  int lastTile = -1;
 
   while (travelled < totalTravel) {
     int remaining = totalTravel - travelled;
@@ -602,7 +678,16 @@ uint8_t spinWheel() {
     travelled += (int)speed;
     if (travelled > totalTravel) travelled = totalTravel;
 
-    drawStrip(travelled % WHEEL_PX);
+    int offset = travelled % WHEEL_PX;
+    drawStrip(offset);
+
+    // Tick once per pocket, but only once it has slowed enough for the
+    // individual ticks to be audible. At full speed it would be a buzz.
+    if (speed < 26.0f) {
+      int tile = ((offset + 160) / TILE_W) % 38;
+      if (tile != lastTile) { sTick(); lastTile = tile; }
+    }
+
     delay(16);
   }
 
@@ -644,7 +729,7 @@ void showResult(uint8_t win, int net) {
   uint16_t c = pocketColor(win);
   tft.fillRoundRect(120, GRID_Y + 4, 80, 52, 6, c);
   tft.drawRoundRect(120, GRID_Y + 4, 80, 52, 6, C_WHITE);
-  numC(win, 160, GRID_Y + 30, 5, C_WHITE);
+  numC(win, 160, GRID_Y + 30, 5, pocketTextColor(win));
 
   const char* word = isGreen(win) ? "GREEN" : (isRed(win) ? "RED" : "BLACK");
   textC(word, 160, GRID_Y + 68, 2, C_WHITE);
@@ -662,7 +747,7 @@ void showResult(uint8_t win, int net) {
     snprintf(buf, sizeof buf, "Even");
   }
   textC(buf, 160, GRID_Y + 90, 2, col);
-  textC("Tap to continue", 160, GRID_Y + 110, 1, C_GREY);
+  textC("Tap or press a key to continue", 160, GRID_Y + 110, 1, C_GREY);
 }
 
 void doSpin() {
@@ -682,13 +767,30 @@ void doSpin() {
   drawHeader();
   drawHistory();
   showResult(win, net);
+
+  // Green when you profit, red when you don't, blue on a push.
+  bool lr = net < 0, lg = net > 0, lb = net == 0;
+  ledSet(lr, lg, lb);
+  if      (net > 0) sWin();
+  else if (net < 0) sLose();
+  else              sPush();
+  for (int i = 0; i < 2; i++) {
+    ledOff();          delay(90);
+    ledSet(lr, lg, lb); delay(90);
+  }
+
   waitForTap();
+  ledOff();
 
   if (bankroll < CHIPS[0]) {
     tft.fillScreen(C_BLACK);
+    ledSet(true, false, false);
     textC("BUSTED", 160, 96, 4, C_LOSE);
-    textC("Tap for a fresh $1000", 160, 140, 2, C_WHITE);
+    sBust();
+    textC("Tap or press a key", 160, 136, 2, C_WHITE);
+    textC("for a fresh $1000", 160, 158, 2, C_WHITE);
     waitForTap();
+    ledOff();
     bankroll = 1000;
     histCount = 0;
   }
@@ -702,6 +804,11 @@ void setup() {
 
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
+
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  ledOff();
 
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
@@ -717,7 +824,7 @@ void setup() {
 
   Serial.println("CYD Roulette ready.");
   Serial.println("No touchscreen? Drive it from here:");
-  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip size");
+  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip size  m mute");
 }
 
 void loop() {
@@ -732,12 +839,13 @@ void loop() {
       clearBets();
       drawHeader();
       drawTable();
+      sClick();
     } else if (inZone(Z_MINUS, x, y)) {
-      if (chipIdx > 0) { chipIdx--; drawChipValue(); }
+      if (chipIdx > 0) { chipIdx--; drawChipValue(); sClick(); }
     } else if (inZone(Z_PLUS, x, y)) {
-      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); }
+      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); sClick(); }
     } else {
-      if (placeBet(x, y)) drawHeader();
+      if (placeBet(x, y)) { drawHeader(); sChip(); }
     }
   }
   delay(20);
