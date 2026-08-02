@@ -35,9 +35,13 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 // any prototype mentioning Zone fails if the type is declared further down.
 struct Zone { int x, y, w, h; };
 
+// Declared early: the sound section persists volume changes immediately,
+// before the rest of the persistence layer is defined further down.
+Preferences prefs;
+
 // Which screen we're on. Spins and result screens block inline, so they
 // don't need entries here.
-enum GState { ST_BET, ST_SCORES, ST_NAME };
+enum GState { ST_LOGIN_NAME, ST_LOGIN_PIN, ST_NEW_PIN, ST_BET, ST_SCORES };
 
 // ------------------------------------------------------------------ Touch ---
 #define XPT2046_IRQ  36
@@ -118,7 +122,25 @@ void waitForTap() {
 #define LED_G 16
 #define LED_B 17
 
-bool soundOn = true;
+// Volume as 4 discrete levels rather than on/off. A piezo/small speaker has
+// no real amplitude control -- it's driven by a square wave that's either on
+// or off -- so "volume" here means the PWM duty cycle of that square wave.
+// Lower duty delivers less average energy to the speaker, which lowers
+// perceived loudness on most CYD boards, but how audible the difference is
+// depends on Gabe's exact speaker/amp circuit. Test on hardware and adjust
+// the DUTY_* constants below if a level doesn't sound right.
+#define VOL_OFF  0
+#define VOL_LOW  1
+#define VOL_MED  2
+#define VOL_HIGH 3
+#define N_VOL_LEVELS 4
+const char* VOL_LABEL[N_VOL_LEVELS] = { "OFF", "LOW", "MED", "HIGH" };
+const int   DUTY_AT_VOL[N_VOL_LEVELS] = { 0, 32, 96, 200 };   // out of 255
+
+int volLevel = VOL_MED;
+
+#define TONE_CHANNEL 0
+#define TONE_RES_BITS 8    // duty is 0-255
 
 void ledSet(bool r, bool g, bool b) {
   digitalWrite(LED_R, r ? LOW : HIGH);
@@ -127,18 +149,34 @@ void ledSet(bool r, bool g, bool b) {
 }
 void ledOff() { ledSet(false, false, false); }
 
-// Non-blocking: the tone plays out on a hardware timer while we keep drawing.
+// Starts a square wave at `freq` with duty scaled to the current volume.
+// Bypasses Arduino's tone() wrapper (which is fixed at 50% duty) so volume
+// is actually adjustable.
+void toneStart(int freq) {
+  int duty = DUTY_AT_VOL[volLevel];
+  if (duty <= 0) return;
+  ledcWriteTone(TONE_CHANNEL, freq);
+  ledcWrite(TONE_CHANNEL, duty);
+}
+void toneStop() { ledcWrite(TONE_CHANNEL, 0); }
+
+// Non-blocking: starts the tone and returns; the caller keeps drawing while
+// the ESP32's LEDC hardware keeps generating the wave. `ms` is honored by a
+// short blocking wait for effects short enough that this doesn't matter, or
+// left to the next toneStart()/toneStop() call to cut it off.
 void blip(int freq, int ms) {
-  if (!soundOn) return;
-  tone(SPEAKER_PIN, freq, ms);
+  if (volLevel == VOL_OFF) return;
+  toneStart(freq);
+  delay(ms);
+  toneStop();
 }
 
-// Blocking, for jingles where we want the notes in order.
+// Blocking, for jingles where notes must play in order.
 void note(int freq, int ms) {
-  if (!soundOn) { delay(ms); return; }
-  tone(SPEAKER_PIN, freq, ms);
+  if (volLevel == VOL_OFF) { delay(ms); return; }
+  toneStart(freq);
   delay(ms);
-  noTone(SPEAKER_PIN);
+  toneStop();
 }
 
 void sClick() { blip(2200, 12); }
@@ -146,9 +184,17 @@ void sChip()  { blip(1400, 18); }
 void sTick()  { blip(1900,  6); }
 
 void sSpinUp() {
-  if (!soundOn) return;
-  for (int f = 400; f < 1600; f += 120) { tone(SPEAKER_PIN, f, 18); delay(14); }
-  noTone(SPEAKER_PIN);
+  if (volLevel == VOL_OFF) return;
+  for (int f = 400; f < 1600; f += 120) { toneStart(f); delay(18); }
+  toneStop();
+}
+
+// Cycles OFF -> LOW -> MED -> HIGH -> OFF, plays a sample tone so the change
+// is audible immediately, and persists the choice.
+void cycleVolume() {
+  volLevel = (volLevel + 1) % N_VOL_LEVELS;
+  prefs.putInt("vol", volLevel);
+  if (volLevel != VOL_OFF) { toneStart(1600); delay(90); toneStop(); }
 }
 
 void sWin() {
@@ -281,31 +327,40 @@ void clearBets() {
 }
 
 // ------------------------------------------------------------ Persistence ---
-// Settings and scores live in the ESP32's flash (NVS), so they survive being
-// unplugged. Note the simulator starts with blank flash every run, so the
-// leaderboard only really persists on the real board.
-Preferences prefs;
+// Accounts, settings, and the house total live in the ESP32's flash (NVS),
+// so they survive being unplugged. The simulator starts with blank flash
+// every run, so accounts only really persist on the real board.
 
-#define NAME_MAX 10
-#define N_SCORES 5
+#define NAME_MAX  10
+#define MAX_USERS 8      // flash-space budget; raise it if the board fills up
 
-char hsName[N_SCORES][NAME_MAX + 1];
-int  hsVal[N_SCORES] = { 0, 0, 0, 0, 0 };
-int  hsNew = -1;            // row just inserted, highlighted on the table
-int  cashPending = 0;       // amount being banked while the name is typed
+char userName[MAX_USERS][NAME_MAX + 1];
+int  userPin[MAX_USERS];       // 0000-9999, stored plainly -- a fun gate, not security
+int  userWallet[MAX_USERS];    // current spendable balance, carries across sessions
+long userNet[MAX_USERS];       // lifetime (returned - staked): the real profit/debt figure
+int  userCount = 0;
+
+int  currentUser = -1;         // -1 = not logged in
+int  loginFailFlash = 0;       // frames left to show a "wrong PIN" flash
+
+GState state = ST_LOGIN_NAME;
+
+// Login-flow buffers. nameBuf doubles as the username field; the on-screen
+// keyboard used for it is the same one, unchanged, that used to collect a
+// name at cash-out time.
 char nameBuf[NAME_MAX + 1];
 int  nameLen = 0;
-
-GState state = ST_BET;
+#define PIN_LEN 4
+char pinBuf[PIN_LEN + 1];
+int  pinLen = 0;
 
 // Whose machine this is, shown under the leaderboard.
 #define HOUSE_NAME "Gabe"
 
-// Everything ever wagered minus everything ever paid out. Net, so a lucky
-// run can drag it back down. Persisted, so it's a running total across every
-// session the board has ever played.
+// Everything ever wagered minus everything ever paid out, across every
+// player and every session. Net, so a lucky run can drag it back down.
 long houseTake = 0;
-int  spinsSinceSave = 0;
+long houseSaved = 0;
 
 // Formats a signed amount with thousands separators: -$1,234,567
 void fmtMoney(char* buf, size_t n, long v) {
@@ -326,46 +381,64 @@ void fmtMoney(char* buf, size_t n, long v) {
   buf[i] = 0;
 }
 
+// Written after every settled spin; NVS appends rather than erasing in
+// place, so per-spin writes land in the tens of millions before wear
+// matters -- far more spins than this board will ever play. Skipped when
+// the total hasn't moved (e.g. a push).
 void saveHouse() {
+  if (houseTake == houseSaved) return;
   prefs.putLong("house", houseTake);
-  spinsSinceSave = 0;
+  houseSaved = houseTake;
 }
 
-void loadScores() {
+void loadUsers() {
+  userCount = prefs.getInt("ucount", 0);
   char k[8];
-  for (int i = 0; i < N_SCORES; i++) {
-    snprintf(k, sizeof k, "hs%dv", i);
-    hsVal[i] = prefs.getInt(k, 0);
-    snprintf(k, sizeof k, "hs%dn", i);
+  for (int i = 0; i < userCount; i++) {
+    snprintf(k, sizeof k, "u%dn", i);
     String nm = prefs.getString(k, "");
-    strncpy(hsName[i], nm.c_str(), NAME_MAX);
-    hsName[i][NAME_MAX] = 0;
+    strncpy(userName[i], nm.c_str(), NAME_MAX);
+    userName[i][NAME_MAX] = 0;
+    snprintf(k, sizeof k, "u%dp", i);
+    userPin[i] = prefs.getInt(k, 0);
+    snprintf(k, sizeof k, "u%dw", i);
+    userWallet[i] = prefs.getInt(k, 1000);
+    snprintf(k, sizeof k, "u%dg", i);
+    userNet[i] = prefs.getLong(k, 0);
   }
 }
 
-void saveScores() {
+void saveUser(int i) {
   char k[8];
-  for (int i = 0; i < N_SCORES; i++) {
-    snprintf(k, sizeof k, "hs%dv", i);
-    prefs.putInt(k, hsVal[i]);
-    snprintf(k, sizeof k, "hs%dn", i);
-    prefs.putString(k, hsName[i]);
-  }
+  snprintf(k, sizeof k, "u%dn", i);
+  prefs.putString(k, userName[i]);
+  snprintf(k, sizeof k, "u%dp", i);
+  prefs.putInt(k, userPin[i]);
+  snprintf(k, sizeof k, "u%dw", i);
+  prefs.putInt(k, userWallet[i]);
+  snprintf(k, sizeof k, "u%dg", i);
+  prefs.putLong(k, userNet[i]);
 }
 
-// Returns the row the score landed in, or -1 if it didn't make the table.
-int insertScore(const char* nm, int v) {
-  int pos = -1;
-  for (int i = 0; i < N_SCORES; i++) if (v > hsVal[i]) { pos = i; break; }
-  if (pos < 0) return -1;
-  for (int i = N_SCORES - 1; i > pos; i--) {
-    hsVal[i] = hsVal[i - 1];
-    strcpy(hsName[i], hsName[i - 1]);
-  }
-  hsVal[pos] = v;
-  strncpy(hsName[pos], nm, NAME_MAX);
-  hsName[pos][NAME_MAX] = 0;
-  return pos;
+// Case-sensitive on purpose: the keyboard only ever produces uppercase, so
+// every stored name is already uppercase and a straight compare is enough.
+int findUser(const char* nm) {
+  for (int i = 0; i < userCount; i++) if (!strcmp(userName[i], nm)) return i;
+  return -1;
+}
+
+// Returns the new slot, or -1 if the board is full.
+int createUser(const char* nm, int pin) {
+  if (userCount >= MAX_USERS) return -1;
+  int i = userCount++;
+  strncpy(userName[i], nm, NAME_MAX);
+  userName[i][NAME_MAX] = 0;
+  userPin[i]    = pin;
+  userWallet[i] = 1000;
+  userNet[i]    = 0;
+  prefs.putInt("ucount", userCount);
+  saveUser(i);
+  return i;
 }
 
 // ---------------------------------------------------------------- History ---
@@ -415,10 +488,12 @@ const Zone Z_SPIN  = { 216, 182, 100, 50 };
 const Zone Z_BANK  = { 220,   0, 100, HDR_H };
 
 // Buttons on the leaderboard screen.
-const Zone Z_CASH  = {  16, 190, 140, 40 };
-const Zone Z_BACK  = { 180, 190, 124, 40 };
+const Zone Z_LOGOUT = {  16, 206, 140, 26 };
+const Zone Z_BACK   = { 180, 206, 124, 26 };
+const Zone Z_VOL    = { 120, 176,  80, 24 };   // volume cycle chip, its own row
 
-// On-screen keyboard: 10 columns x 4 rows of 32x40 cells.
+// On-screen A-Z0-9 keyboard: 10 columns x 4 rows of 32x40 cells. Used for
+// username entry.
 #define KB_X0   0
 #define KB_Y0   76
 #define KB_CW   32
@@ -430,6 +505,16 @@ const Zone Z_BACK  = { 180, 190, 124, 40 };
 #define KB_DEL  37
 #define KB_OK   38
 const char* KB_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+// Numeric PIN pad: a 3x4 phone-style grid, cells 80x36.
+// 1 2 3 / 4 5 6 / 7 8 9 / DEL 0 OK
+#define PIN_X0  40
+#define PIN_Y0  86
+#define PIN_CW  80
+#define PIN_CH  36
+const char* PIN_LAYOUT[12] = {
+  "1","2","3", "4","5","6", "7","8","9", "DEL","0","OK"
+};
 
 bool inZone(const Zone &z, int x, int y) {
   return x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h;
@@ -596,63 +681,82 @@ void drawAll() {
 }
 
 // ------------------------------------------------------------ Score screen ---
+// Defined much further down (in the keyboard-cursor section), but logInAs
+// below needs to call it to show/hide the WASD cursor on login.
+void drawCursorBox();
+
+// ------------------------------------------------------------ Leaderboard ---
+// Auto-computed from stored accounts, sorted by lifetime net profit -- no
+// manual name entry, since your identity comes from login now.
 void drawScoresScreen() {
   tft.fillScreen(C_BLACK);
   tft.fillRect(0, 0, SCR_W, HDR_H, C_PANEL);
-  textC("HIGH SCORES", 160, HDR_H / 2, 2, C_GOLD);
+  textC("TOP PLAYERS", 160, HDR_H / 2, 2, C_GOLD);
 
-  int pot = bankroll + totalStaked();
+  // Simple selection sort over a small array; userCount maxes out at 8.
+  int order[MAX_USERS];
+  for (int i = 0; i < userCount; i++) order[i] = i;
+  for (int i = 0; i < userCount; i++) {
+    int best = i;
+    for (int j = i + 1; j < userCount; j++)
+      if (userNet[order[j]] > userNet[order[best]]) best = j;
+    int t = order[i]; order[i] = order[best]; order[best] = t;
+  }
 
-  for (int i = 0; i < N_SCORES; i++) {
-    int y = 30 + i * 24;
-    uint16_t col = (i == hsNew) ? C_GOLD : C_WHITE;
+  // Names are truncated to 6 characters for display only (the full name is
+  // still what's used to log in) so a long name can never collide with a
+  // wide negative amount like -$987,654,321 in the same row.
+  #define NAME_SHOW 6
+
+  int rows = userCount < 5 ? userCount : 5;
+  for (int r = 0; r < rows; r++) {
+    int u = order[r];
+    int y = 28 + r * 22;
+    uint16_t col = (u == currentUser) ? C_GOLD : C_WHITE;
 
     char rank[4];
-    snprintf(rank, sizeof rank, "%d.", i + 1);
+    snprintf(rank, sizeof rank, "%d.", r + 1);
     textAt(rank, 10, y, 2, col);
 
-    const char* nm = hsName[i][0] ? hsName[i] : "---";
-    textAt(nm, 42, y, 2, col);
+    char shown[NAME_SHOW + 1];
+    strncpy(shown, userName[u], NAME_SHOW);
+    shown[NAME_SHOW] = 0;
+    textAt(shown, 42, y, 2, col);
 
-    char v[16];
-    snprintf(v, sizeof v, "$%d", hsVal[i]);
-    textR(v, SCR_W - 10, y + 8, 2, col);
+    char v[24];
+    fmtMoney(v, sizeof v, userNet[u]);
+    textR(v, SCR_W - 10, y + 8, 2, userNet[u] < 0 ? C_LOSE : col);
   }
 
   // The house's running total, small, under a divider.
-  tft.drawFastHLine(10, 152, SCR_W - 20, C_LINE);
+  tft.drawFastHLine(10, 150, SCR_W - 20, C_LINE);
   char money[28], line[48];
   fmtMoney(money, sizeof money, houseTake);
   snprintf(line, sizeof line, "%s's $$$: %s", HOUSE_NAME, money);
-  textC(line, 160, 163, 1, houseTake < 0 ? C_LOSE : C_GOLD);
+  textC(line, 160, 162, 1, houseTake < 0 ? C_LOSE : C_GOLD);
 
-  if (hsNew >= 0) {
-    textC("Tap or send any key to play on", 160, 182, 1, C_GREY);
-  } else {
-    char cash[24];
-    snprintf(cash, sizeof cash, "CASH OUT $%d", pot);
-    drawButton(Z_CASH, cash, C_GOLD, 1);
-    drawButton(Z_BACK, "BACK", C_WHITE, 2);
-    textC("x = cash out    b = back", 160, 178, 1, C_GREY);
-  }
+  char vol[16];
+  snprintf(vol, sizeof vol, "Vol: %s", VOL_LABEL[volLevel]);
+  drawButton(Z_VOL, vol, C_WHITE, 1);
+
+  drawButton(Z_LOGOUT, "LOG OUT", C_GOLD, 1);
+  drawButton(Z_BACK, "BACK", C_WHITE, 1);
 }
 
-// ------------------------------------------------------------- Name entry ---
+// ------------------------------------------------------------ Login: name ---
 void drawNameText() {
   tft.fillRect(0, 30, SCR_W, 40, C_BLACK);
   const char* shown = nameLen ? nameBuf : "_";
   textC(shown, 160, 48, 3, C_GOLD);
 }
 
-void drawNameEntry() {
+void drawLoginName() {
   tft.fillScreen(C_BLACK);
   tft.fillRect(0, 0, SCR_W, HDR_H, C_PANEL);
-  char t[32];
-  snprintf(t, sizeof t, "YOU BANKED $%d", cashPending);
-  textC(t, 160, HDR_H / 2, 2, C_GOLD);
+  textC("TINY BAR CASINO", 160, HDR_H / 2, 2, C_GOLD);
 
   drawNameText();
-  textC("tap keys, or type your name and press Enter", 160, 70, 1, C_GREY);
+  textC("Enter your name -- new or returning", 160, 70, 1, C_GREY);
 
   for (int r = 0; r < KB_ROWS; r++) {
     for (int c = 0; c < KB_COLS; c++) {
@@ -677,17 +781,6 @@ void drawNameEntry() {
   }
 }
 
-// Commits the typed name to the table. Shared by touch and keyboard.
-void submitName() {
-  while (nameLen > 0 && nameBuf[nameLen - 1] == ' ') nameBuf[--nameLen] = 0;
-  if (nameLen == 0) { drawNameText(); return; }
-  hsNew = insertScore(nameBuf, cashPending);
-  saveScores();
-  sWin();
-  state = ST_SCORES;
-  drawScoresScreen();
-}
-
 void typeChar(char ch) {
   if (nameLen >= NAME_MAX) return;
   nameBuf[nameLen++] = ch;
@@ -703,6 +796,124 @@ void backspace() {
   drawNameText();
 }
 
+// ------------------------------------------------------------- Login: PIN ---
+void drawPinDots() {
+  tft.fillRect(0, 30, SCR_W, 40, C_BLACK);
+  char dots[PIN_LEN + 1];
+  int i = 0;
+  for (; i < pinLen; i++) dots[i] = '*';
+  dots[i] = 0;
+  const char* shown = pinLen ? dots : "----";
+  textC(shown, 160, 48, 4, C_GOLD);
+}
+
+void drawPinPad(const char* title, const char* sub) {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, SCR_W, HDR_H, C_PANEL);
+  textC(title, 160, HDR_H / 2, 2, C_GOLD);
+
+  drawPinDots();
+  textC(sub, 160, 74, 1, C_GREY);
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int idx = r * 3 + c;
+      int x = PIN_X0 + c * PIN_CW, y = PIN_Y0 + r * PIN_CH;
+      tft.drawRect(x, y, PIN_CW, PIN_CH, C_LINE);
+      const char* lbl = PIN_LAYOUT[idx];
+      uint16_t col = C_WHITE;
+      if (!strcmp(lbl, "OK"))  col = C_GOLD;
+      if (!strcmp(lbl, "DEL")) col = C_GREY;
+      textC(lbl, x + PIN_CW / 2, y + PIN_CH / 2, 2, col);
+    }
+  }
+}
+
+void drawLoginPin() {
+  char sub[NAME_MAX + 32];
+  snprintf(sub, sizeof sub, "Welcome back, %s. Enter your PIN.", nameBuf);
+  drawPinPad("ENTER PIN", sub);
+}
+
+void drawNewPin() {
+  drawPinPad("CHOOSE A PIN", "New account -- pick any 4 digits");
+}
+
+void pinDigit(char d) {
+  if (pinLen >= PIN_LEN) return;
+  pinBuf[pinLen++] = d;
+  pinBuf[pinLen] = 0;
+  sClick();
+  drawPinDots();
+}
+
+void pinBackspace() {
+  if (pinLen == 0) return;
+  pinBuf[--pinLen] = 0;
+  sClick();
+  drawPinDots();
+}
+
+// Loads an account into the live game state and goes to the table.
+void logInAs(int u) {
+  currentUser = u;
+  bankroll = userWallet[u];
+  clearBets();
+  histCount = 0;
+  state = ST_BET;
+  sWin();
+  drawAll();
+  drawCursorBox();
+}
+
+void tryLogin() {
+  int u = findUser(nameBuf);
+  if (u < 0) {
+    // New name: go set a PIN for it.
+    pinLen = 0; pinBuf[0] = 0;
+    if (userCount >= MAX_USERS) {
+      textC("Board is full (8/8 accounts).", 160, 70, 1, C_LOSE);
+      textC("Ask Gabe to clear a slot, or log in as someone else.", 160, 82, 1, C_LOSE);
+      sLose();
+      return;
+    }
+    state = ST_NEW_PIN;
+    drawNewPin();
+    return;
+  }
+  pinLen = 0; pinBuf[0] = 0;
+  state = ST_LOGIN_PIN;
+  drawLoginPin();
+}
+
+void submitName() {
+  while (nameLen > 0 && nameBuf[nameLen - 1] == ' ') nameBuf[--nameLen] = 0;
+  if (nameLen == 0) return;
+  tryLogin();
+}
+
+void submitLoginPin() {
+  if (pinLen < PIN_LEN) return;
+  int u = findUser(nameBuf);
+  int entered = atoi(pinBuf);
+  if (u >= 0 && userPin[u] == entered) {
+    logInAs(u);
+  } else {
+    sLose();
+    pinLen = 0; pinBuf[0] = 0;
+    drawLoginPin();
+    textC("Wrong PIN, try again", 160, 74, 1, C_LOSE);
+  }
+}
+
+void submitNewPin() {
+  if (pinLen < PIN_LEN) return;
+  int u = createUser(nameBuf, atoi(pinBuf));
+  if (u < 0) { state = ST_LOGIN_NAME; drawLoginName(); return; }
+  logInAs(u);
+}
+
+// ---------------------------------------------------------------- Placing ---
 // ---------------------------------------------------------------- Placing ---
 bool placeBet(int x, int y) {
   int chip = CHIPS[chipIdx];
@@ -741,14 +952,21 @@ bool placeBet(int x, int y) {
 // The simulator has no touch, so the board can also be driven from the serial
 // monitor. The cursor stays hidden until the first key arrives, so on real
 // hardware -- where nothing is typed -- none of this ever shows up.
-// Defined further down; the key handler needs them early.
+// Defined further down; the key handler and login screens need them early.
 void doSpin();
-void doCashOut();
-void openScores();
 void resetGame();
+void openScores();
 void submitName();
+void tryLogin();
+void submitLoginPin();
+void submitNewPin();
 void typeChar(char ch);
 void backspace();
+void pinDigit(char d);
+void pinBackspace();
+void cycleVolume();
+void drawCursorBox();
+void drawAll();
 
 bool kbActive = false;
 int curSec = 0;      // 0 = number grid, 1 = dozens, 2 = even money
@@ -841,26 +1059,38 @@ void printKeyHelp() {
 }
 
 void handleKey(char k) {
-  if (!kbActive && k != '\n' && k != '\r') {
-    kbActive = true; drawCursorBox(); printKeyHelp();
-  }
-
-  // While typing a name, letters are letters -- not movement commands.
-  if (state == ST_NAME) {
+  // Login/PIN screens don't use the WASD cursor at all -- handle them first,
+  // completely separately, before any of that machinery kicks in.
+  if (state == ST_LOGIN_NAME) {
     if (k == '\n' || k == '\r') { submitName(); return; }
     if (k == 8 || k == 127 || k == '<') { backspace(); return; }
     if (k >= 'a' && k <= 'z') k = k - 'a' + 'A';
     if ((k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9') || k == ' ') typeChar(k);
     return;
   }
+  if (state == ST_LOGIN_PIN || state == ST_NEW_PIN) {
+    if (k == '\n' || k == '\r') {
+      if (state == ST_LOGIN_PIN) submitLoginPin(); else submitNewPin();
+      return;
+    }
+    if (k == 8 || k == 127 || k == '<') { pinBackspace(); return; }
+    if (k >= '0' && k <= '9') pinDigit(k);
+    return;
+  }
+
+  if (!kbActive && k != '\n' && k != '\r') {
+    kbActive = true; drawCursorBox(); printKeyHelp();
+  }
 
   if (k == '\n' || k == '\r') return;    // Wokwi sends a newline per line
 
   if (state == ST_SCORES) {
-    if (hsNew >= 0)                    { resetGame(); return; }
-    if (k == 'x' || k == 'X')          { sClick(); doCashOut(); }
-    else if (k == 'b' || k == 'B' ||
-             k == 'k' || k == 'K')     { sClick(); state = ST_BET; drawAll(); drawCursorBox(); }
+    if (k == 'o' || k == 'O')          {
+      sClick(); currentUser = -1; nameLen = 0; nameBuf[0] = 0;
+      state = ST_LOGIN_NAME; drawLoginName();
+    } else if (k == 'b' || k == 'B' ||
+               k == 'k' || k == 'K')   { sClick(); state = ST_BET; drawAll(); drawCursorBox(); }
+    else if (k == 'v' || k == 'V')     { cycleVolume(); drawScoresScreen(); }
     return;
   }
 
@@ -886,11 +1116,8 @@ void handleKey(char k) {
     case '+': case '=':
       if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); sClick(); }
       break;
-    case 'm': case 'M':
-      soundOn = !soundOn;
-      prefs.putBool("sound", soundOn);
-      if (soundOn) sClick();
-      Serial.printf("Sound %s\n", soundOn ? "on" : "off");
+    case 'v': case 'V':
+      cycleVolume();
       break;
     default: break;
   }
@@ -1052,7 +1279,13 @@ void doSpin() {
   int net = ret - staked;
 
   houseTake -= net;              // player's net loss is the house's gain
-  if (++spinsSinceSave >= 20) saveHouse();
+  saveHouse();                   // every spin; nothing lost to a yanked plug
+
+  if (currentUser >= 0) {
+    userWallet[currentUser] = bankroll;   // the wallet IS the live bankroll
+    userNet[currentUser]   += net;        // lifetime truth: never reset by a
+    saveUser(currentUser);                // free bust-refill, only by real bets
+  }
 
   pushHistory(win);
   clearBets();
@@ -1097,46 +1330,40 @@ void doSpin() {
 }
 
 // ----------------------------------------------------------- Screen flow ---
+// A bust still gives a free $1000 to keep playing, and that refill updates
+// the wallet -- but NOT the lifetime net, which only moves from real bets.
+// That's the whole point: the wallet is a play-money convenience, the
+// lifetime figure on the leaderboard is the honest answer to "am I up or
+// down", and a free refill can't quietly launder a bad run.
 void resetGame() {
   bankroll = 1000;
+  if (currentUser >= 0) { userWallet[currentUser] = bankroll; saveUser(currentUser); }
   clearBets();
   histCount = 0;
-  hsNew = -1;
   state = ST_BET;
   drawAll();
   drawCursorBox();
 }
 
-void doCashOut() {
-  cashPending = bankroll + totalStaked();
-  clearBets();
-  saveHouse();
-  Serial.printf("Cash out: $%d\n", cashPending);
-
-  if (cashPending > hsVal[N_SCORES - 1]) {
-    nameLen = 0; nameBuf[0] = 0;
-    state = ST_NAME;
-    drawNameEntry();
-  } else {
-    sLose();
-    resetGame();
-  }
-}
-
 void openScores() {
   saveHouse();
-  hsNew = -1;
+  if (currentUser >= 0) saveUser(currentUser);
   state = ST_SCORES;
   drawScoresScreen();
 }
 
 void handleTapScores(int x, int y) {
-  if (hsNew >= 0) { resetGame(); return; }   // just set a score: any tap plays on
-  if (inZone(Z_CASH, x, y)) { sClick(); doCashOut(); }
-  else if (inZone(Z_BACK, x, y)) { sClick(); state = ST_BET; drawAll(); drawCursorBox(); }
+  if (inZone(Z_LOGOUT, x, y)) {
+    sClick(); currentUser = -1; nameLen = 0; nameBuf[0] = 0;
+    state = ST_LOGIN_NAME; drawLoginName();
+  } else if (inZone(Z_BACK, x, y)) {
+    sClick(); state = ST_BET; drawAll(); drawCursorBox();
+  } else if (inZone(Z_VOL, x, y)) {
+    cycleVolume(); drawScoresScreen();
+  }
 }
 
-void handleTapName(int x, int y) {
+void handleTapLoginName(int x, int y) {
   if (x < KB_X0 || y < KB_Y0) return;
   int c = (x - KB_X0) / KB_CW, r = (y - KB_Y0) / KB_CH;
   if (c >= KB_COLS || r >= KB_ROWS) return;
@@ -1145,6 +1372,17 @@ void handleTapName(int x, int y) {
   else if (idx == KB_SPC)   typeChar(' ');
   else if (idx == KB_DEL)   backspace();
   else                      submitName();
+}
+
+void handleTapPin(int x, int y, bool isNew) {
+  if (x < PIN_X0 || y < PIN_Y0) return;
+  int c = (x - PIN_X0) / PIN_CW, r = (y - PIN_Y0) / PIN_CH;
+  if (c >= 3 || r >= 4) return;
+  int idx = r * 3 + c;
+  const char* lbl = PIN_LAYOUT[idx];
+  if      (!strcmp(lbl, "DEL")) pinBackspace();
+  else if (!strcmp(lbl, "OK"))  { if (isNew) submitNewPin(); else submitLoginPin(); }
+  else                          pinDigit(lbl[0]);
 }
 
 void handleTapBetting(int x, int y) {
@@ -1176,6 +1414,9 @@ void setup() {
   pinMode(LED_B, OUTPUT);
   ledOff();
 
+  ledcSetup(TONE_CHANNEL, 2000, TONE_RES_BITS);
+  ledcAttachPin(SPEAKER_PIN, TONE_CHANNEL);
+
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
   tft.setRotation(1);            // landscape, 320 x 240
@@ -1186,16 +1427,20 @@ void setup() {
   ts.setRotation(1);
 
   prefs.begin("roulette", false);
-  soundOn = prefs.getBool("sound", true);
-  loadScores();
+  volLevel = prefs.getInt("vol", VOL_MED);
+  loadUsers();
   houseTake = prefs.getLong("house", 0);
+  houseSaved = houseTake;
 
-  clearBets();
-  drawAll();
+  nameLen = 0; nameBuf[0] = 0;
+  state = ST_LOGIN_NAME;
+  drawLoginName();
 
   Serial.println("CYD Roulette ready.");
   Serial.println("No touchscreen? Drive it from here:");
-  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip  k scores  m mute");
+  Serial.println("  Login: type your name, Enter. Then your 4-digit PIN, Enter.");
+  Serial.println("  Table: w/a/s/d move  p place  g spin  c clear  - + chip");
+  Serial.println("         k scores  v volume");
 }
 
 void loop() {
@@ -1204,9 +1449,11 @@ void loop() {
   int x, y;
   if (getTap(x, y)) {
     switch (state) {
-      case ST_BET:    handleTapBetting(x, y); break;
-      case ST_SCORES: handleTapScores(x, y);  break;
-      case ST_NAME:   handleTapName(x, y);    break;
+      case ST_LOGIN_NAME: handleTapLoginName(x, y);       break;
+      case ST_LOGIN_PIN:  handleTapPin(x, y, false);       break;
+      case ST_NEW_PIN:    handleTapPin(x, y, true);        break;
+      case ST_BET:        handleTapBetting(x, y);          break;
+      case ST_SCORES:     handleTapScores(x, y);           break;
     }
   }
   delay(20);
