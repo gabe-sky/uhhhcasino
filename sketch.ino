@@ -28,6 +28,12 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
 #define SCR_W 320
 #define SCR_H 240
 
+// ------------------------------------------------------------------ Types ---
+// This must come before the first function definition. The Arduino IDE
+// inserts its auto-generated prototypes right above the first function, and
+// any prototype mentioning Zone fails if the type is declared further down.
+struct Zone { int x, y, w, h; };
+
 // ------------------------------------------------------------------ Touch ---
 #define XPT2046_IRQ  36
 #define XPT2046_MOSI 32
@@ -214,8 +220,6 @@ void pushHistory(uint8_t n) {
 #define EVEN_H    24
 
 #define PANEL_Y   176
-
-struct Zone { int x, y, w, h; };
 
 const Zone Z_MINUS = {   4, 182, 30, 26 };
 const Zone Z_PLUS  = {  86, 182, 30, 26 };
