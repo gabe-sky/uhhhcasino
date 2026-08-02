@@ -70,10 +70,17 @@ bool getTap(int &x, int &y) {
   return fresh;
 }
 
+// Continues on either a screen tap or any key typed into the serial monitor.
+// Without the serial half, the result screen would hang forever in a
+// simulator that has no touch.
 void waitForTap() {
-  while (ts.touched())  delay(20);
-  while (!ts.touched()) delay(20);
-  while (ts.touched())  delay(20);
+  while (ts.touched()) delay(20);
+  while (Serial.available()) Serial.read();
+  for (;;) {
+    if (ts.touched()) { while (ts.touched()) delay(20); return; }
+    if (Serial.available()) { while (Serial.available()) Serial.read(); return; }
+    delay(20);
+  }
 }
 
 // ----------------------------------------------------------------- Colors ---
@@ -424,6 +431,127 @@ bool placeBet(int x, int y) {
   return false;
 }
 
+// --------------------------------------------------------- Keyboard play ---
+// The simulator has no touch, so the board can also be driven from the serial
+// monitor. The cursor stays hidden until the first key arrives, so on real
+// hardware -- where nothing is typed -- none of this ever shows up.
+void doSpin();          // defined below, called by the key handler
+
+bool kbActive = false;
+int curSec = 0;      // 0 = number grid, 1 = dozens, 2 = even money
+int curCol = 6;      // 0 = zero A, 1..12 = number columns, 13 = zero B
+int curRow = 1;      // 0 = top row, 2 = bottom row
+int curDz  = 1;
+int curOb  = 2;
+
+// The number under the cursor, or -1 if the cursor isn't on the grid.
+int cursorNumber() {
+  if (curSec != 0) return -1;
+  if (curCol == 0)  return ZERO_A;
+  if (curCol == 13) return ZERO_B;
+  return (curCol - 1) * 3 + (2 - curRow) + 1;
+}
+
+Zone cursorZone() {
+  Zone z;
+  if (curSec == 0) {
+    int n = cursorNumber();
+    numberCell((uint8_t)n, z.x, z.y, z.w, z.h);
+  } else if (curSec == 1) {
+    z.w = GRID_W / 3;
+    z.x = GRID_X + curDz * z.w;
+    z.y = DOZ_Y;  z.h = DOZ_H;
+  } else {
+    z.w = GRID_W / 6;
+    z.x = GRID_X + curOb * z.w;
+    z.y = EVEN_Y; z.h = EVEN_H;
+  }
+  return z;
+}
+
+void redrawUnderCursor() {
+  if      (curSec == 0) drawOneNumber((uint8_t)cursorNumber());
+  else if (curSec == 1) drawDozens();
+  else                  drawEvenMoney();
+}
+
+void drawCursorBox() {
+  if (!kbActive) return;
+  Zone z = cursorZone();
+  tft.drawRect(z.x,     z.y,     z.w,     z.h,     C_WHITE);
+  tft.drawRect(z.x + 1, z.y + 1, z.w - 2, z.h - 2, C_WHITE);
+}
+
+void moveCursor(int dx, int dy) {
+  redrawUnderCursor();
+  if (dy < 0) {                               // up
+    if      (curSec == 2) { curSec = 1; curDz = curOb / 2; }
+    else if (curSec == 1) { curSec = 0; curRow = 2; }
+    else if (curRow > 0)  curRow--;
+  } else if (dy > 0) {                        // down
+    if      (curSec == 0 && curRow < 2) curRow++;
+    else if (curSec == 0) { curSec = 1; }
+    else if (curSec == 1) { curSec = 2; curOb = curDz * 2; }
+  }
+  if (dx != 0) {
+    if      (curSec == 0) curCol = constrain(curCol + dx, 0, 13);
+    else if (curSec == 1) curDz  = constrain(curDz  + dx, 0, 2);
+    else                  curOb  = constrain(curOb  + dx, 0, 5);
+  }
+  drawCursorBox();
+}
+
+void placeAtCursor() {
+  int chip = CHIPS[chipIdx];
+  if (bankroll < chip) return;
+  if (curSec == 0) {
+    int n = cursorNumber();
+    betNum[n] += chip; bankroll -= chip;
+    drawOneNumber((uint8_t)n);
+  } else if (curSec == 1) {
+    betDozen[curDz] += chip; bankroll -= chip;
+    drawDozens();
+  } else {
+    betOutside[curOb] += chip; bankroll -= chip;
+    drawEvenMoney();
+  }
+  drawCursorBox();
+  drawHeader();
+}
+
+void printKeyHelp() {
+  Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip size");
+  Serial.println("(type into the box under the serial monitor, then press Enter)");
+}
+
+void handleKey(char k) {
+  if (k == '\n' || k == '\r') return;       // Wokwi sends a newline per line
+  if (!kbActive) { kbActive = true; drawCursorBox(); printKeyHelp(); }
+
+  switch (k) {
+    case 'w': case 'W': moveCursor(0, -1); break;
+    case 's': case 'S': moveCursor(0,  1); break;
+    case 'a': case 'A': moveCursor(-1, 0); break;
+    case 'd': case 'D': moveCursor( 1, 0); break;
+    case 'p': case 'P': case ' ': placeAtCursor(); break;
+    case 'g': case 'G':
+      if (totalStaked() > 0) { doSpin(); drawCursorBox(); }
+      break;
+    case 'c': case 'C':
+      bankroll += totalStaked();
+      clearBets();
+      drawHeader(); drawTable(); drawCursorBox();
+      break;
+    case '-': case '_':
+      if (chipIdx > 0) { chipIdx--; drawChipValue(); }
+      break;
+    case '+': case '=':
+      if (chipIdx < N_CHIPS - 1) { chipIdx++; drawChipValue(); }
+      break;
+    default: break;
+  }
+}
+
 // ------------------------------------------------------------- The spin -----
 // A strip of pockets rips past a marker and decelerates onto the winner.
 #define STRIP_Y  (GRID_Y + 14)
@@ -588,9 +716,13 @@ void setup() {
   drawAll();
 
   Serial.println("CYD Roulette ready.");
+  Serial.println("No touchscreen? Drive it from here:");
+  Serial.println("  w/a/s/d move  p place  g spin  c clear  - + chip size");
 }
 
 void loop() {
+  while (Serial.available()) handleKey((char)Serial.read());
+
   int x, y;
   if (getTap(x, y)) {
     if (inZone(Z_SPIN, x, y)) {
