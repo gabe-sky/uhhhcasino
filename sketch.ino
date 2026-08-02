@@ -298,6 +298,39 @@ int  nameLen = 0;
 
 GState state = ST_BET;
 
+// Whose machine this is, shown under the leaderboard.
+#define HOUSE_NAME "Gabe"
+
+// Everything ever wagered minus everything ever paid out. Net, so a lucky
+// run can drag it back down. Persisted, so it's a running total across every
+// session the board has ever played.
+long houseTake = 0;
+int  spinsSinceSave = 0;
+
+// Formats a signed amount with thousands separators: -$1,234,567
+void fmtMoney(char* buf, size_t n, long v) {
+  bool neg = v < 0;
+  unsigned long a = neg ? (unsigned long)(-v) : (unsigned long)v;
+  char tmp[24];
+  int t = 0, digits = 0;
+  if (a == 0) tmp[t++] = '0';
+  while (a > 0) {
+    tmp[t++] = (char)('0' + (a % 10));
+    a /= 10;
+    if (++digits % 3 == 0 && a > 0) tmp[t++] = ',';
+  }
+  size_t i = 0;
+  if (neg && i + 1 < n) buf[i++] = '-';
+  if (i + 1 < n) buf[i++] = '$';
+  while (t > 0 && i + 1 < n) buf[i++] = tmp[--t];
+  buf[i] = 0;
+}
+
+void saveHouse() {
+  prefs.putLong("house", houseTake);
+  spinsSinceSave = 0;
+}
+
 void loadScores() {
   char k[8];
   for (int i = 0; i < N_SCORES; i++) {
@@ -571,7 +604,7 @@ void drawScoresScreen() {
   int pot = bankroll + totalStaked();
 
   for (int i = 0; i < N_SCORES; i++) {
-    int y = 34 + i * 26;
+    int y = 30 + i * 24;
     uint16_t col = (i == hsNew) ? C_GOLD : C_WHITE;
 
     char rank[4];
@@ -586,15 +619,21 @@ void drawScoresScreen() {
     textR(v, SCR_W - 10, y + 8, 2, col);
   }
 
+  // The house's running total, small, under a divider.
+  tft.drawFastHLine(10, 152, SCR_W - 20, C_LINE);
+  char money[28], line[48];
+  fmtMoney(money, sizeof money, houseTake);
+  snprintf(line, sizeof line, "%s's $$$: %s", HOUSE_NAME, money);
+  textC(line, 160, 163, 1, houseTake < 0 ? C_LOSE : C_GOLD);
+
   if (hsNew >= 0) {
-    textC("Tap anywhere to play on", 160, 176, 1, C_GREY);
+    textC("Tap or send any key to play on", 160, 182, 1, C_GREY);
   } else {
     char cash[24];
     snprintf(cash, sizeof cash, "CASH OUT $%d", pot);
     drawButton(Z_CASH, cash, C_GOLD, 1);
     drawButton(Z_BACK, "BACK", C_WHITE, 2);
-    textC("Cashing out banks your total and restarts at $1000",
-          160, 172, 1, C_GREY);
+    textC("x = cash out    b = back", 160, 178, 1, C_GREY);
   }
 }
 
@@ -613,6 +652,7 @@ void drawNameEntry() {
   textC(t, 160, HDR_H / 2, 2, C_GOLD);
 
   drawNameText();
+  textC("tap keys, or type your name and press Enter", 160, 70, 1, C_GREY);
 
   for (int r = 0; r < KB_ROWS; r++) {
     for (int c = 0; c < KB_COLS; c++) {
@@ -1011,6 +1051,9 @@ void doSpin() {
   bankroll += ret;
   int net = ret - staked;
 
+  houseTake -= net;              // player's net loss is the house's gain
+  if (++spinsSinceSave >= 20) saveHouse();
+
   pushHistory(win);
   clearBets();
 
@@ -1042,6 +1085,7 @@ void doSpin() {
     sBust();
     textC("Tap or send x", 160, 136, 2, C_WHITE);
     textC("for a fresh $1000", 160, 158, 2, C_WHITE);
+    saveHouse();
     waitForTap();
     ledOff();
     resetGame();
@@ -1066,6 +1110,7 @@ void resetGame() {
 void doCashOut() {
   cashPending = bankroll + totalStaked();
   clearBets();
+  saveHouse();
   Serial.printf("Cash out: $%d\n", cashPending);
 
   if (cashPending > hsVal[N_SCORES - 1]) {
@@ -1079,6 +1124,7 @@ void doCashOut() {
 }
 
 void openScores() {
+  saveHouse();
   hsNew = -1;
   state = ST_SCORES;
   drawScoresScreen();
@@ -1142,6 +1188,7 @@ void setup() {
   prefs.begin("roulette", false);
   soundOn = prefs.getBool("sound", true);
   loadScores();
+  houseTake = prefs.getLong("house", 0);
 
   clearBets();
   drawAll();
