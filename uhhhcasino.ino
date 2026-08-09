@@ -605,7 +605,6 @@ void deleteUser(int i) {
 }
 
 // ---------------------------------------------------------------- History ---
-// ---------------------------------------------------------------- History ---
 #define MAX_HIST 15
 uint8_t hist[MAX_HIST];
 int histCount = 0;
@@ -841,9 +840,17 @@ void drawChipValue() {
   textC(CHIP_LABEL[chipIdx], CHIPBOX_X + CHIPBOX_W / 2, 195, 2, C_GOLD);
 }
 
-// REBET and 2X share a row and change with table state, so they get their
-// own redraw rather than forcing a whole-panel repaint on every chip tap.
-// REBET greys out with no saved bet; 2X only appears once money is down.
+// Gold once there's money on the table, grey when there's nothing to spin
+// for. Tapping it while grey was already a no-op -- this just says so up
+// front instead of letting the tap die silently.
+void drawSpinButton() {
+  drawButton(Z_SPIN, "SPIN", totalStaked() > 0 ? C_GOLD : C_GREY, 3);
+}
+
+// The three buttons that change with table state, redrawn together rather
+// than forcing a whole-panel repaint on every chip tap. REBET greys out with
+// no saved bet, 2X only appears once money is down, SPIN greys until it is.
+// Every place that changes the stake already calls this.
 void drawActionButtons() {
   tft.fillRect(0, 210, 212, 28, C_BLACK);
 
@@ -854,16 +861,24 @@ void drawActionButtons() {
   if (staked > 0) {
     drawButton(Z_2X, "2X", bankroll >= staked ? C_WIN : C_GREY, 2);
   }
+
+  drawSpinButton();
+}
+
+// The betting controls only mean anything while bets are open, so the spin
+// blanks the whole strip and drawPanel() puts it back when the table reopens.
+// Nothing else draws below PANEL_Y, so once cleared it stays clear.
+void clearPanel() {
+  tft.fillRect(0, PANEL_Y, SCR_W, SCR_H - PANEL_Y, C_BLACK);
 }
 
 void drawPanel() {
-  tft.fillRect(0, PANEL_Y, SCR_W, SCR_H - PANEL_Y, C_BLACK);
+  clearPanel();
   drawButton(Z_MINUS, "-", C_WHITE, 2);
   drawButton(Z_PLUS,  "+", C_WHITE, 2);
   drawChipValue();
   drawButton(Z_CLEAR, "CLEAR", C_WHITE, 2);
-  drawButton(Z_SPIN,  "SPIN",  C_GOLD, 3);
-  drawActionButtons();
+  drawActionButtons();          // draws SPIN too, in the right state
 }
 
 void drawTable() {
@@ -1243,7 +1258,6 @@ void submitNewPin() {
 }
 
 // ---------------------------------------------------------------- Placing ---
-// ---------------------------------------------------------------- Placing ---
 bool placeBet(int x, int y) {
   int chip = CHIPS[chipIdx];
   if (bankroll < chip) return false;
@@ -1322,21 +1336,12 @@ void doDoubleBets() {
 // The simulator has no touch, so the board can also be driven from the serial
 // monitor. The cursor stays hidden until the first key arrives, so on real
 // hardware -- where nothing is typed -- none of this ever shows up.
-// Defined further down; the key handler and login screens need them early.
+// Defined further down; the key handler needs them early. Everything else it
+// calls (the login screens, cycleVolume, drawAll, drawCursorBox) is already
+// defined or declared above this point.
 void doSpin();
 void resetGame();
 void openScores();
-void submitName();
-void tryLogin();
-void submitLoginPin();
-void submitNewPin();
-void typeChar(char ch);
-void backspace();
-void pinDigit(char d);
-void pinBackspace();
-void cycleVolume();
-void drawCursorBox();
-void drawAll();
 
 bool kbActive = false;
 int curSec = 0;      // 0 = number grid, 1 = dozens, 2 = even money
@@ -1425,7 +1430,7 @@ void placeAtCursor() {
 
 void printKeyHelp() {
   Serial.println("Keyboard: w/a/s/d move  p place  g spin  c clear  - + chip");
-  Serial.println("          k scores/cash out  m mute");
+  Serial.println("          r rebet  t double  k scores/cash out  v volume");
   Serial.println("(type into the box under the serial monitor, then press Enter)");
 }
 
@@ -1518,8 +1523,16 @@ void handleKey(char k) {
 
 // ------------------------------------------------------------- The spin -----
 // A strip of pockets rips past a marker and decelerates onto the winner.
-#define STRIP_Y  (GRID_Y + 14)
+// The strip's height is fixed; where it sits depends on the spin. Normally it
+// rides high in the otherwise-empty table area. A lightning reveal fills that
+// space with struck numbers down to y=156, and the strip needs 49px including
+// its marker -- more than fits above PANEL_Y. So on a lightning spin it drops
+// into the space the betting panel vacated when bets closed, leaving the
+// struck numbers readable the whole way through.
 #define STRIP_H  40
+#define STRIP_HI (GRID_Y + 14)   // 56: nothing above it to dodge
+#define STRIP_LO 190             // clears a full 5-row lightning list
+int stripY = STRIP_HI;
 #define TILE_W   44
 #define WHEEL_PX (38 * TILE_W)
 
@@ -1531,7 +1544,7 @@ void handleKey(char k) {
 // blur we skip them entirely (you couldn't read them anyway, and a real wheel
 // is a blur too), and even when slow we only letter the tiles near the marker.
 void drawStrip(int offset, bool detail) {
-  int cy = STRIP_Y + STRIP_H / 2;
+  int cy = stripY + STRIP_H / 2;
   int first = offset / TILE_W;
   int shift = offset % TILE_W;
 
@@ -1543,8 +1556,8 @@ void drawStrip(int offset, bool detail) {
     if (cxTile < -TILE_W || cxTile > SCR_W + TILE_W) continue;
 
     uint16_t c = pocketColor(n);
-    tft.fillRect(x, STRIP_Y, TILE_W - 2, STRIP_H, c);
-    tft.drawRect(x, STRIP_Y, TILE_W - 2, STRIP_H, C_LINE);
+    tft.fillRect(x, stripY, TILE_W - 2, STRIP_H, c);
+    tft.drawRect(x, stripY, TILE_W - 2, STRIP_H, C_LINE);
 
     // Only letter the three tiles closest to the marker.
     if (detail && cxTile > 160 - 90 && cxTile < 160 + 90) {
@@ -1552,8 +1565,8 @@ void drawStrip(int offset, bool detail) {
     }
   }
 
-  tft.fillTriangle(160, STRIP_Y - 9, 153, STRIP_Y - 1, 167, STRIP_Y - 1, C_GOLD);
-  tft.drawFastVLine(160, STRIP_Y, STRIP_H, C_GOLD);
+  tft.fillTriangle(160, stripY - 9, 153, stripY - 1, 167, stripY - 1, C_GOLD);
+  tft.drawFastVLine(160, stripY, STRIP_H, C_GOLD);
 }
 
 // How long a spin lasts, in milliseconds. This is wall-clock time, not a
@@ -1754,11 +1767,16 @@ uint8_t spinWheel() {
   int winIdx = esp_random() % 38;
 
   ledOff();
+  clearPanel();                  // bets are closed -- take the controls away
   tft.fillRect(0, GRID_Y - 2, SCR_W, PANEL_Y - GRID_Y + 2, C_BLACK);
   textC("No more bets!", 160, PANEL_Y - 14, 2, C_GOLD);
 
   rollLightning();
   drawLightningReveal();
+
+  // Drop the strip below the struck numbers only when there are some; a plain
+  // spin keeps it high so the screen isn't left bottom-heavy.
+  stripY = (lightningOn && lightCount > 0) ? STRIP_LO : STRIP_HI;
 
   sSpinUp();
 
@@ -1812,7 +1830,10 @@ int settle(uint8_t win) {
 }
 
 void showResult(uint8_t win, int net) {
-  tft.fillRect(0, GRID_Y - 2, SCR_W, PANEL_Y - GRID_Y + 2, C_BLACK);
+  // Clear all the way to the bottom, not just to PANEL_Y: bets are still
+  // closed so the panel is hidden, and a lightning spin will have left the
+  // strip's final frame sitting down in that space.
+  tft.fillRect(0, GRID_Y - 2, SCR_W, SCR_H - GRID_Y + 2, C_BLACK);
 
   uint16_t c = pocketColor(win);
   tft.fillRoundRect(120, GRID_Y + 4, 80, 52, 6, c);
@@ -1861,6 +1882,14 @@ void doSpin() {
   pushHistory(win);
   saveLastBet();                 // capture for REBET before the table clears
   clearBets();
+
+  // A losing run can leave the selected chip bigger than what's left in the
+  // wallet, and then every tap on the table silently does nothing. Clamp it
+  // down to whatever is still affordable. (giveRefill does the same thing on
+  // the other path into a smaller bankroll.) Must come after clearBets(): the
+  // stake that just lost is still sitting in the bet arrays until then, and
+  // maxChipIdx() counts money on the table as spendable.
+  if (chipIdx > maxChipIdx()) chipIdx = maxChipIdx();
 
   Serial.printf("Spin: %d  staked %d  returned %d  net %+d  bankroll %d\n",
                 win, staked, ret, net, bankroll);
@@ -2031,7 +2060,7 @@ void setup() {
   Serial.println("No touchscreen? Drive it from here:");
   Serial.println("  Login: type your name, Enter. Then your 4-digit PIN, Enter.");
   Serial.println("  Table: w/a/s/d move  p place  g spin  c clear  - + chip");
-  Serial.println("         k scores  v volume");
+  Serial.println("         r rebet  t double  k scores  v volume");
 }
 
 void loop() {
