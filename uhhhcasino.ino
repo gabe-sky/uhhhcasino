@@ -1201,7 +1201,7 @@ void tryLogin() {
     // New name: go set a PIN for it.
     pinLen = 0; pinBuf[0] = 0;
     if (userCount >= MAX_USERS) {
-      textC("Board is full (8/8 accounts).", 160, 70, 1, C_LOSE);
+      textC("Board is full (12/12 accounts).", 160, 70, 1, C_LOSE);
       textC("Ask Gabe to clear a slot, or log in as someone else.", 160, 82, 1, C_LOSE);
       sLose();
       return;
